@@ -327,6 +327,12 @@ async function handleMessage(msg) {
 
   if (!text) return;
 
+  // Telegram appends @username to commands inside groups, e.g. "/start@Nahsebot_bot".
+  // Normalize so command matching works whether or not the suffix is present.
+  let cmd = text;
+  const cm = text.match(/^(\/[A-Za-z0-9_]+)(@[A-Za-z0-9_]+)?/);
+  if (cm) cmd = cm[1];
+
   // Private chat: always reply, but also remember every message.
   // Group chat: only reply when mentioned/replied; only auto-log when "บอลจดงาน" appears.
   const isGroup = chatId < 0;
@@ -362,7 +368,7 @@ async function handleMessage(msg) {
     autoLog = true;
   }
 
-  if (text === '/start' || text === '/help') {
+  if (cmd === '/start' || cmd === '/help') {
     await sendMessage(chatId, [
       '👤 *บอล* — คนจดงานประจำกลุ่ม',
       '',
@@ -393,7 +399,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (text === '/clear') {
+  if (cmd === '/clear') {
     clearHistory(userId);
     clearNotes(userId);
     await sendMessage(chatId, 'ล้างประวัติและบันทึกแล้ว', replyTo);
@@ -401,7 +407,7 @@ async function handleMessage(msg) {
   }
 
   // Keep /usage and /model as quick info commands
-  if (text === '/usage') {
+  if (cmd === '/usage') {
     await sendMessage(chatId, [
       '*การใช้งาน (deploy นี้)*',
       '',
@@ -412,7 +418,7 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (text === '/model') {
+  if (cmd === '/model') {
     await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens\nEndpoint: ${BASE_URL}`, replyTo);
     return;
   }
