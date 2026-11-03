@@ -15,7 +15,7 @@ Optional:
 
 | Variable | Default |
 |----------|---------|
-| `VYCE_MODEL` | `claude-sonnet-4-6` |
+| `VYCE_MODEL` | `beam-1.0` |
 | `VYCE_BASE_URL` | `https://vyceai.com/v1` |
 | `MAX_OUTPUT_TOKENS` | `4096` |
 | `CONTEXT_TURNS` | `20` |

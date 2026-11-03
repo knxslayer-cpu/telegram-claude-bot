@@ -20,7 +20,7 @@ import fs from 'node:fs';
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const API_KEY = process.env.VYCE_API_KEY || '';
 const BASE_URL = (process.env.VYCE_BASE_URL || 'https://vyceai.com/v1').replace(/\/+$/, '');
-const MODEL = process.env.VYCE_MODEL || 'claude-sonnet-4-6';
+const MODEL = process.env.VYCE_MODEL || 'beam-1.0';
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 4096);
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   'You are a smart, helpful assistant. You take notes, answer questions, and help with work. ' +
