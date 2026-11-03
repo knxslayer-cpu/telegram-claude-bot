@@ -44,6 +44,8 @@ const userTimestamps = new Map();
 const globalTimestamps = [];
 const conversations = new Map();
 const notes = new Map();
+const groupContext = new Map(); // chatId -> recent messages ring buffer
+const GROUP_CONTEXT_TURNS = Number(process.env.GROUP_CONTEXT_TURNS || 15);
 let usage = { tokens: 0, calls: 0 };
 let offset = 0;
 
@@ -254,6 +256,63 @@ function saveTaskNote(userId, msg, content) {
   addNote(userId, `[${tag}] ${content}`);
 }
 
+// Keep a ring buffer of recent group messages for context-based logging.
+function pushGroupContext(chatId, entry) {
+  let buf = groupContext.get(chatId);
+  if (!buf) { buf = []; groupContext.set(chatId, buf); }
+  buf.push(entry);
+  while (buf.length > GROUP_CONTEXT_TURNS) buf.shift();
+}
+
+// Use AI to decide which recent messages are actual work tasks and log them.
+async function analyzeAndLogTasks(userId, chatId) {
+  const buf = groupContext.get(chatId) || [];
+  if (!buf.length) return 'ไม่มีข้อความในบริบทให้จด';
+
+  const transcript = buf.map(e => `${e.who}: ${e.text}`).join('\n');
+  const prompt = `นี่คือประวัติแชทล่าสุดในกลุ่ม:\n${transcript}\n\n` +
+    `จงวิเคราะห์ว่าในประวัตินี้ มีข้อความไหนที่เป็น "การสั่งงาน" หรือ "งานที่ต้องทำ" บ้าง ` +
+    `(เช่น สั่งให้ทำอะไร, นัดหมาย, มอบหมายภารกิจ) ไม่ใช่แค่บทสนทนาทั่วไป。\n` +
+    `ตอบกลับในรูปแบบ JSON เท่านั้น: {"tasks": [{"who": "ชื่อคนพิมพ์", "tag": "ฝ่ายหรือชื่อเป้าหมายถ้ามี เช่น ฝ่ายIT หรือ สมชาย ถ้าไม่มีให้ใช้ชื่อคนพิมพ์", "task": "เนื้อหางานที่ต้องทำ"}]}\n` +
+    `ถ้าไม่มีงานเลย ให้ตอบ {"tasks": []}`;
+
+  const payload = {
+    model: MODEL,
+    messages: [{ role: 'user', content: prompt }],
+    max_tokens: MAX_TOKENS,
+    stream: false,
+    response_format: { type: 'json_object' },
+  };
+
+  const r = await fetch(CHAT_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'authorization': `Bearer ${API_KEY}` },
+    body: JSON.stringify(payload),
+  });
+  const raw = await r.text();
+  if (!r.ok) throw new Error(`vyce ${r.status}: ${raw.slice(0, 300)}`);
+  const j = JSON.parse(raw);
+  let text = j.choices?.[0]?.message?.content || '{}';
+
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return 'ไม่สามารถวิเคราะห์ได้'; }
+
+  const tasks = parsed.tasks || [];
+  if (!tasks.length) return 'ไม่พบการสั่งงานในบริบทนี้';
+
+  let logged = 0;
+  for (const t of tasks) {
+    const who = t.who || 'unknown';
+    const tag = t.tag || who;
+    const task = t.task || '';
+    if (task.trim().length > 1) {
+      addNote(userId, `[${tag}] ${task}`);
+      logged++;
+    }
+  }
+  return `จดแล้ว ✅ (${logged} รายการ • รวม ${getNotes(userId).length})`;
+}
+
 // ─── message handling ─────────────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
@@ -268,7 +327,13 @@ async function handleMessage(msg) {
   const isGroup = chatId < 0;
   let shouldReply = true;
   let autoLog = false;
+  let explicitLogCommand = false;
+
   if (isGroup) {
+    // Always store group messages in the context ring buffer.
+    const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
+    pushGroupContext(chatId, { who, text });
+
     const mentionsMe = msg.entities &&
       msg.entities.some(e => e.type === 'mention' && text.slice(e.offset, e.offset + e.length).startsWith('@'));
     const replyToBot = msg.reply_to_message &&
@@ -281,8 +346,10 @@ async function handleMessage(msg) {
       const m = text.match(/^@\w+\s*/);
       if (m) msg.text = text.slice(m[0].length).trim();
     }
-    // Auto-log in group only when explicitly told "บอลจดงาน" / "บอล จดงาน"
-    autoLog = /บอล\s*จดงาน/i.test(text);
+    // "บอลจดงาน" anywhere in a group message = analyze context and log tasks.
+    if (/บอล\s*จดงาน/i.test(text)) {
+      explicitLogCommand = true;
+    }
   } else {
     // Private chat: remember every message automatically.
     autoLog = true;
@@ -304,11 +371,12 @@ async function handleMessage(msg) {
       '',
       'การจดงาน:',
       '• แชทส่วนตัว: ฉันจำทุกข้อความให้อัตโนมัติ',
-      '• กลุ่ม: พิมพ์ "บอลจดงาน" นำหน้า ข้อความใด ๆ ฉันจะจด (เช่น "บอลจดงาน ฝ่ายIT ทำรายงาน")',
+      '• กลุ่ม: พิมพ์ "บอลจดงาน" (ไม่ว่าจะตรงไหนในข้อความ) ฉันจะวิเคราะห์แชทย้อนหลัง หางานที่สั่งแล้วจดเอง',
+      '• สั่งจดเฉพาะข้อความ: "จดงานนี้: ..." หรือ "ของ X ทำ Y"',
       'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
-      'ในกลุ่ม: ฉันจดทุกข้อความอัตโนมัติ',
-      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้ทำงาน',
+      'ในกลุ่ม: ฉันอ่านทุกข้อความแต่จดเฉพาะเมื่อมีคนบอก "บอลจดงาน"',
+      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้สรุป/ตอบ',
       '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
@@ -349,6 +417,19 @@ async function handleMessage(msg) {
       `Tokens: ${usage.tokens.toLocaleString()}`,
       `Model: ${MODEL}`,
     ].join('\n'), replyTo);
+    return;
+  }
+
+  // Explicit "บอลจดงาน" in a group -> analyze recent context and log tasks via AI.
+  if (explicitLogCommand && isGroup) {
+    await sendTyping(chatId);
+    try {
+      const result = await analyzeAndLogTasks(userId, chatId);
+      await sendMessage(chatId, result, replyTo);
+    } catch (e) {
+      log('analyze error: %s', e.message);
+      await sendMessage(chatId, `Error: ${e.message.slice(0, 150)}`, replyTo);
+    }
     return;
   }
 
