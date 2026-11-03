@@ -97,6 +97,36 @@ function saveState() {
   } catch {}
 }
 
+// ─── runtime config (taught rules + group trigger) ────────────────────
+// Persisted to CONFIG_FILE so settings survive restarts without code edits.
+const CONFIG_FILE = process.env.CONFIG_FILE || 'bot-config.json';
+let config = { groupTrigger: 'บอล', rules: [] };
+let triggerRegex = null;
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Build a regex from a comma-separated trigger list. Empty => reply to ALL group messages.
+function buildTriggerRegex(t) {
+  if (!t || !t.trim()) return null;
+  const parts = t.split(',').map(s => s.trim()).filter(Boolean).map(escapeRegex);
+  return new RegExp(parts.join('|'), 'i');
+}
+
+function loadConfig() {
+  try {
+    const c = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    config = { groupTrigger: c.groupTrigger ?? 'บอล', rules: Array.isArray(c.rules) ? c.rules : [] };
+  } catch {}
+  triggerRegex = config.groupTrigger ? buildTriggerRegex(config.groupTrigger) : null;
+  log('config: trigger=%s rules=%d', config.groupTrigger || '(all)', config.rules.length);
+}
+
+function saveConfig() {
+  try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config)); } catch {}
+}
+
 // ─── rate limiter ─────────────────────────────────────────────────────
 function pruneOld(arr, windowMs) {
   const cutoff = Date.now() - windowMs;
@@ -166,6 +196,9 @@ async function callVyce(history, systemPrompt, userNotes) {
   let sysContent = systemPrompt;
   if (userNotes && userNotes.length) {
     sysContent += '\n\nNotes from previous conversations:\n' + userNotes.map(n => `- ${n}`).join('\n');
+  }
+  if (config.rules.length) {
+    sysContent += '\n\nกฎเพิ่มเติมที่ผู้ใช้สอนให้ (ต้องปฏิบัติตามเสมอ):\n' + config.rules.map(r => `- ${r}`).join('\n');
   }
 
   const messages = [
@@ -365,9 +398,9 @@ async function handleMessage(msg) {
       msg.reply_to_message.from &&
       msg.reply_to_message.from.is_bot === true &&
       msg.reply_to_message.from.username === BOT_USERNAME;
-    const mentionsByName = /บอล/i.test(text);
-    // Reply only when: mentioned by @username, replied to, or the word "บอล" appears.
-    shouldReply = mentionsByName; // group: only react when the word "บอล" appears
+    const mentionsByName = triggerRegex ? triggerRegex.test(text) : true;
+    // Group: only react when the configured trigger word(s) appear (reply to all if disabled).
+    shouldReply = mentionsByName;
     // Strip the leading @mention so the model isn't confused by it.
     if (mentionsMe) {
       const m = text.match(/^@\w+\s*/);
@@ -406,6 +439,8 @@ async function handleMessage(msg) {
       'พิมพ์ "บอลจดงาน" (ไม่ว่าตรงไหน) เพื่อให้ฉันวิเคราะห์แชทย้อนหลังแล้วจดงาน',
       'หมายเหตุ: ในกลุ่มฉันจะเงียบหากข้อความไม่มีคำว่า "บอล"',
       '',
+      'ตั้งค่าเองได้ (ไม่ต้องแก้โค้ด): /trigger <คำ> เปลี่ยนคำเรียกกลุ่ม • /teach <ข้อความ> สอนกฎ • /rules ดู • /resetrules ล้าง',
+      '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
       `Rate: ${PER_USER_RPM} msg/min`,
@@ -435,6 +470,56 @@ async function handleMessage(msg) {
   if (cmd === '/model') {
     await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens\nEndpoint: ${BASE_URL}`, replyTo);
     return;
+  }
+
+  // ─── runtime teaching commands (no code edits needed) ───────────────
+  if (cmd === '/teach' || cmd === '/สอน') {
+    const instr = text.replace(/^\/(teach|สอน)\s*/i, '').trim();
+    if (!instr) {
+      await sendMessage(chatId, 'ใช้งาน: /teach <ข้อความที่จะสอน> เช่น /teach ตอบด้วยภาษาอังกฤษ', replyTo);
+      return;
+    }
+    config.rules.push(instr);
+    saveConfig();
+    await sendMessage(chatId, `สอนแล้ว ✅ (${config.rules.length} กฎ)\n• ${instr}`, replyTo);
+    return;
+  }
+
+  if (cmd === '/trigger') {
+    const w = text.replace(/^\/trigger\s*/i, '').trim();
+    config.groupTrigger = w;
+    triggerRegex = buildTriggerRegex(w);
+    saveConfig();
+    await sendMessage(chatId, w
+      ? `ตั้งคำเรียกในกลุ่มเป็น: "${w}" (ตอบเฉพาะเมื่อข้อความมีคำนี้ — รองรับหลายคำคั่นด้วยคอมมา เช่น บอล,ball)`
+      : `ปิดการจำกัด — บอทจะตอบข้อความกลุ่มทั้งหมด`, replyTo);
+    return;
+  }
+
+  if (cmd === '/rules') {
+    const t = config.groupTrigger ? `"${config.groupTrigger}"` : 'ตอบทั้งหมด';
+    const rs = config.rules.length ? config.rules.map((r, i) => `${i + 1}. ${r}`).join('\n') : '(ยังไม่มี)';
+    await sendMessage(chatId, `*คำเรียกกลุ่ม:* ${t}\n\n*กฎที่สอน:*\n${rs}`, replyTo);
+    return;
+  }
+
+  if (cmd === '/resetrules') {
+    config.rules = [];
+    saveConfig();
+    await sendMessage(chatId, 'ล้างกฎที่สอนแล้ว (คำเรียกกลุ่มคงเดิม)', replyTo);
+    return;
+  }
+
+  // Natural-language teaching in private: "สอนว่า ..." / "จงจำว่า ..."
+  if (!isGroup) {
+    const nat = text.match(/^(สอนว่า|จงจำว่า|สอนให้|ให้จำว่า)\s*(.+)$/s);
+    if (nat) {
+      const instr = nat[2].trim();
+      config.rules.push(instr);
+      saveConfig();
+      await sendMessage(chatId, `สอนแล้ว ✅ (${config.rules.length} กฎ)\n• ${instr}`, replyTo);
+      return;
+    }
   }
 
   // Explicit "บอลจดงาน" in a group -> analyze recent context and log tasks via AI.
@@ -572,6 +657,7 @@ async function main() {
   }
 
   loadState();
+  loadConfig();
 
   healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
     log('health server on :%d', HEALTH_PORT);
