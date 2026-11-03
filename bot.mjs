@@ -450,14 +450,6 @@ async function handleMessage(msg) {
     return;
   }
 
-  // Auto-log silently when triggered (group: only on "บอลจดงาน"; private: always).
-  if (autoLog && !/จด|บันทึก|note|save|เพิ่มงาน/i.test(text)) {
-    if (text && text.length > 2) {
-      saveTaskNote(userId, msg, text);
-    }
-    return;
-  }
-
   // Explicit "จดงาน" style command -> save directly, confirm briefly (no AI call).
   if (/จด|บันทึก|note|save|เพิ่มงาน/i.test(text)) {
     const m = text.match(/(?:จดงานนี้|จด|บันทึก|note|save|เพิ่มงาน)\s*[:：]?\s*(.*)/is);
@@ -467,6 +459,11 @@ async function handleMessage(msg) {
       await sendMessage(chatId, `จดแล้ว ✅ (${getNotes(userId).length} รายการ)`, replyTo);
       return;
     }
+  }
+
+  // Private chat: silently remember every message, but STILL answer as a normal AI.
+  if (autoLog && text && text.length > 2) {
+    saveTaskNote(userId, msg, text);
   }
 
   const allow = userAllowed(userId);
