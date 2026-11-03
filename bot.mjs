@@ -30,6 +30,7 @@ const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
 const CONTEXT_TURNS = Number(process.env.CONTEXT_TURNS || 20);
 const HEALTH_PORT = Number(process.env.PORT || 3000);
+let BOT_USERNAME = '';
 const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const CHAT_URL = `${BASE_URL}/chat/completions`;
 
@@ -242,6 +243,23 @@ async function handleMessage(msg) {
 
   if (!text) return;
 
+  // In group chats, only respond when the bot is mentioned by username.
+  const isGroup = chatId < 0;
+  if (isGroup) {
+    const mentionsMe = msg.entities &&
+      msg.entities.some(e => e.type === 'mention' && text.slice(e.offset, e.offset + e.length).startsWith('@'));
+    const replyToBot = msg.reply_to_message &&
+      msg.reply_to_message.from &&
+      msg.reply_to_message.from.is_bot === true &&
+      msg.reply_to_message.from.username === BOT_USERNAME;
+    if (!mentionsMe && !replyToBot) return;
+    // Strip the leading @mention so the model isn't confused by it.
+    if (mentionsMe) {
+      const m = text.match(/^@\w+\s*/);
+      if (m) msg.text = text.slice(m[0].length).trim();
+    }
+  }
+
   if (text === '/start' || text === '/help') {
     await sendMessage(chatId, [
       '*Vyce AI Bot* — ผู้ช่วยอัจฉริยะ',
@@ -255,6 +273,8 @@ async function handleMessage(msg) {
       '/clearnotes — ล้างบันทึก',
       '/usage — ดูการใช้งาน',
       '/model — ดูโมเดลปัจจุบัน',
+      '',
+      'ในกลุ่ม: ต้อง mention ชื่อ bot นำหน้า (เช่น @botname สวัสดี) หรือ reply หา bot',
       '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
@@ -406,6 +426,7 @@ async function main() {
   });
 
   const me = await tg('getMe');
+  BOT_USERNAME = me.username;
   log('bot online: @%s (%s)', me.username, me.first_name);
   log('model: %s  max_tokens: %d  context: %d turns', MODEL, MAX_TOKENS, CONTEXT_TURNS);
   log('rate: %d rpm/user  %d rpm global', PER_USER_RPM, GLOBAL_RPM);
