@@ -263,10 +263,11 @@ async function handleMessage(msg) {
 
   if (!text) return;
 
-  // In groups: read every message, only reply when mentioned or replied to.
-  // In private chat: always reply (don't silently log).
+  // Private chat: always reply, but also remember every message.
+  // Group chat: only reply when mentioned/replied; only auto-log when "บอลจดงาน" appears.
   const isGroup = chatId < 0;
   let shouldReply = true;
+  let autoLog = false;
   if (isGroup) {
     const mentionsMe = msg.entities &&
       msg.entities.some(e => e.type === 'mention' && text.slice(e.offset, e.offset + e.length).startsWith('@'));
@@ -280,6 +281,11 @@ async function handleMessage(msg) {
       const m = text.match(/^@\w+\s*/);
       if (m) msg.text = text.slice(m[0].length).trim();
     }
+    // Auto-log in group only when explicitly told "บอลจดงาน" / "บอล จดงาน"
+    autoLog = /บอล\s*จดงาน/i.test(text);
+  } else {
+    // Private chat: remember every message automatically.
+    autoLog = true;
   }
 
   if (text === '/start' || text === '/help') {
@@ -295,6 +301,10 @@ async function handleMessage(msg) {
       '• ถามอะไรก็ได้ → ฉันตอบ',
       '',
       'ฉันจดงานแยกตามเป้าหมายอัตโนมัติ — พิมพ์ "ของ X" "ให้ X" "ฝ่าย X" ในข้อความใด ๆ ฉันจะจดไว้ให้คน/ฝ่ายนั้น',
+      '',
+      'การจดงาน:',
+      '• แชทส่วนตัว: ฉันจำทุกข้อความให้อัตโนมัติ',
+      '• กลุ่ม: พิมพ์ "บอลจดงาน" นำหน้า ข้อความใด ๆ ฉันจะจด (เช่น "บอลจดงาน ฝ่ายIT ทำรายงาน")',
       'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
       'ในกลุ่ม: ฉันจดทุกข้อความอัตโนมัติ',
@@ -342,8 +352,8 @@ async function handleMessage(msg) {
     return;
   }
 
-  // If not mentioned/replied in a group, silently capture the message as a task note.
-  if (!shouldReply) {
+  // Auto-log silently when triggered (group: only on "บอลจดงาน"; private: always).
+  if (autoLog && !/จด|บันทึก|note|save|เพิ่มงาน/i.test(text)) {
     if (text && text.length > 2) {
       saveTaskNote(userId, msg, text);
     }
