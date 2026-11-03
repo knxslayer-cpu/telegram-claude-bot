@@ -263,7 +263,8 @@ async function handleMessage(msg) {
 
   if (!text) return;
 
-  // Always read every message for note-taking. Only reply when mentioned or replied to.
+  // In groups: read every message, only reply when mentioned or replied to.
+  // In private chat: always reply (don't silently log).
   const isGroup = chatId < 0;
   let shouldReply = true;
   if (isGroup) {
