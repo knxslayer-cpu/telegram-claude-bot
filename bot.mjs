@@ -1,13 +1,14 @@
-// telegram-claude-railway — single-process Telegram bot backed by Anthropic API.
+// telegram-vyce-railway — single-process Telegram bot backed by Vyce AI API.
+// OpenAI-compatible endpoint, 42+ models, $50 free credits.
 // Designed for Railway.app: one container, one port, zero dependencies.
 //
 // Architecture:
-//   Telegram ──long poll──> this process ──API Key──> api.anthropic.com
+//   Telegram ──long poll──> this process ──OpenAI format──> vyceai.com/v1
 //
 // Railway env vars:
-//   TELEGRAM_BOT_TOKEN      — from @BotFather
-//   ANTHROPIC_API_KEY       — from https://console.anthropic.com/settings/keys
-//   ALLOWED_USERS           — comma-separated Telegram user IDs (optional)
+//   TELEGRAM_BOT_TOKEN   — from @BotFather
+//   VYCE_API_KEY         — from https://vyceai.com (your API key)
+//   ALLOWED_USERS        — comma-separated Telegram user IDs (optional)
 //
 // Railway auto-provides PORT. We listen on it for health checks.
 // Telegram uses long polling (outbound), so no inbound webhook port needed.
@@ -17,23 +18,26 @@ import fs from 'node:fs';
 
 // ─── config ───────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const UPSTREAM = (process.env.ANTHROPIC_UPSTREAM || 'https://api.anthropic.com').replace(/\/+$/, '');
-const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
-const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 2048);
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 'You are a helpful assistant. Reply concisely in the same language the user wrote.';
+const API_KEY = process.env.VYCE_API_KEY || '';
+const BASE_URL = (process.env.VYCE_BASE_URL || 'https://vyceai.com/v1').replace(/\/+$/, '');
+const MODEL = process.env.VYCE_MODEL || 'claude-sonnet-4-6';
+const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 4096);
+const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
+  'You are a smart, helpful assistant. You take notes, answer questions, and help with work. ' +
+  'Reply in the same language the user wrote. Be concise but thorough.';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
-const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 40);
-const MONTHLY_CREDIT_CAP = Number(process.env.MONTHLY_CREDIT_CAP || 5);
+const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
-const CONTEXT_TURNS = Number(process.env.CONTEXT_TURNS || 6);
+const CONTEXT_TURNS = Number(process.env.CONTEXT_TURNS || 20);
 const HEALTH_PORT = Number(process.env.PORT || 3000);
 const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
+const CHAT_URL = `${BASE_URL}/chat/completions`;
 
 // ─── state ────────────────────────────────────────────────────────────
 const userTimestamps = new Map();
 const globalTimestamps = [];
 const conversations = new Map();
+const notes = new Map();
 let usage = { tokens: 0, calls: 0 };
 let offset = 0;
 
@@ -46,10 +50,7 @@ function log(fmt, ...args) {
   console.log(ts, msg);
 }
 
-// ─── state persistence (in-memory on Railway — ephemeral) ────────────
-// Railway containers restart = state lost. Token counter resets on redeploy.
-// For persistence, add a Railway Volume and set STATE_FILE to the mounted path.
-
+// ─── state persistence ────────────────────────────────────────────────
 function loadState() {
   const sf = process.env.STATE_FILE;
   if (!sf) return;
@@ -63,7 +64,12 @@ function loadState() {
         conversations.set(Number(k), v);
       }
     }
-    log('state loaded: calls=%d tokens=%d', usage.calls, usage.tokens);
+    if (s.notes) {
+      for (const [k, v] of Object.entries(s.notes)) {
+        notes.set(Number(k), v);
+      }
+    }
+    log('state loaded: calls=%d tokens=%d notes=%d', usage.calls, usage.tokens, notes.size);
   } catch {
     log('no prior state, starting fresh');
   }
@@ -75,7 +81,9 @@ function saveState() {
   try {
     const convObj = {};
     for (const [k, v] of conversations) convObj[k] = v;
-    fs.writeFileSync(sf, JSON.stringify({ offset, usage, conversations: convObj }));
+    const notesObj = {};
+    for (const [k, v] of notes) notesObj[k] = v;
+    fs.writeFileSync(sf, JSON.stringify({ offset, usage, conversations: convObj, notes: notesObj }));
   } catch {}
 }
 
@@ -131,34 +139,32 @@ async function sendTyping(chatId) {
   try { await tg('sendChatAction', { chat_id: chatId, action: 'typing' }); } catch {}
 }
 
-// ─── anthropic API call ───────────────────────────────────────────────
-class RateLimitError extends Error {
-  constructor(retryAfter, raw) {
-    super(`rate limited: retry after ${retryAfter}s`);
-    this.retryAfter = retryAfter;
-    this.raw = raw;
+// ─── vyce AI call (OpenAI-compatible) ─────────────────────────────────
+async function callVyce(history, systemPrompt, userNotes) {
+  let sysContent = systemPrompt;
+  if (userNotes && userNotes.length) {
+    sysContent += '\n\nNotes from previous conversations:\n' + userNotes.map(n => `- ${n}`).join('\n');
   }
-}
 
-async function callClaude(messages, systemPrompt) {
+  const messages = [
+    { role: 'system', content: sysContent },
+    ...history.map(m => ({ role: m.role, content: m.content })),
+  ];
+
   const payload = {
     model: MODEL,
-    max_tokens: MAX_TOKENS,
-    system: systemPrompt,
     messages,
+    max_tokens: MAX_TOKENS,
     stream: false,
   };
 
-  const url = `${UPSTREAM}/v1/messages`;
-  log('-> anthropic %s model=%s msgs=%d', url, MODEL, messages.length);
+  log('-> vyce model=%s msgs=%d notes=%d', MODEL, messages.length, userNotes?.length || 0);
 
-  const r = await fetch(url, {
+  const r = await fetch(CHAT_URL, {
     method: 'POST',
     headers: {
-      'x-api-key': API_KEY,
-      'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
-      'user-agent': 'telegram-claude-bot/1.0.0',
+      'authorization': `Bearer ${API_KEY}`,
     },
     body: JSON.stringify(payload),
   });
@@ -166,40 +172,29 @@ async function callClaude(messages, systemPrompt) {
   const raw = await r.text();
 
   if (r.status === 429) {
-    let retryAfter = 60;
-    try {
-      const j = JSON.parse(raw);
-      const msg = j.error?.message || '';
-      const m = msg.match(/(\d+)\s*second/i);
-      if (m) retryAfter = Number(m[1]);
-    } catch {}
-    throw new RateLimitError(retryAfter, raw);
+    throw new Error('vyce rate limited — wait a moment and try again');
   }
 
   if (!r.ok) {
-    throw new Error(`anthropic ${r.status}: ${raw.slice(0, 500)}`);
+    throw new Error(`vyce ${r.status}: ${raw.slice(0, 500)}`);
   }
 
   const j = JSON.parse(raw);
 
-  let inputTokens = j.usage?.input_tokens || 0;
-  let outputTokens = j.usage?.output_tokens || 0;
-  let total = inputTokens + outputTokens;
-
   let text = '';
-  if (j.content && Array.isArray(j.content)) {
-    text = j.content.filter(b => b.type === 'text').map(b => b.text).join('\n');
-  } else if (typeof j.content === 'string') {
-    text = j.content;
+  if (j.choices && j.choices[0]) {
+    text = j.choices[0].message?.content || j.choices[0].text || '';
   }
 
+  let totalTokens = j.usage?.total_tokens || 0;
+
   usage.calls += 1;
-  usage.tokens += total;
+  usage.tokens += totalTokens;
   saveState();
 
-  log('<- tokens: in=%d out=%d total=%d calls=%d', inputTokens, outputTokens, total, usage.calls);
+  log('<- tokens: %d calls=%d', totalTokens, usage.calls);
 
-  return { text, inputTokens, outputTokens, total };
+  return { text, totalTokens };
 }
 
 // ─── conversation context ─────────────────────────────────────────────
@@ -220,6 +215,24 @@ function clearHistory(userId) {
   saveState();
 }
 
+function getNotes(userId) {
+  let n = notes.get(userId);
+  if (!n) { n = []; notes.set(userId, n); }
+  return n;
+}
+
+function addNote(userId, text) {
+  const n = getNotes(userId);
+  n.push(text);
+  while (n.length > 100) n.shift();
+  saveState();
+}
+
+function clearNotes(userId) {
+  notes.delete(userId);
+  saveState();
+}
+
 // ─── message handling ─────────────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
@@ -231,39 +244,69 @@ async function handleMessage(msg) {
 
   if (text === '/start' || text === '/help') {
     await sendMessage(chatId, [
-      '*Claude Telegram Bot*',
+      '*Vyce AI Bot* — ผู้ช่วยอัจฉริยะ',
       '',
-      'Send any message — Claude will reply.',
+      'ส่งข้อความอะไรก็ได้ — จดบันทึก ถามคำถาม หรือคุยงาน',
       '',
-      `/clear — clear chat history`,
-      `/usage — token usage`,
-      `/model — current model`,
+      'คำสั่ง:',
+      '/clear — ล้างประวัติแชท',
+      '/notes — ดูบันทึกทั้งหมด',
+      '/savenote <ข้อความ> — บันทึก',
+      '/clearnotes — ล้างบันทึก',
+      '/usage — ดูการใช้งาน',
+      '/model — ดูโมเดลปัจจุบัน',
       '',
-      `Rate: ${PER_USER_RPM} msg/min/user`,
-      `Credit cap warning: $${MONTHLY_CREDIT_CAP} USD`,
+      `Model: ${MODEL}`,
+      `Context: ${CONTEXT_TURNS} turns`,
+      `Rate: ${PER_USER_RPM} msg/min`,
     ].join('\n'), replyTo);
     return;
   }
 
   if (text === '/clear') {
     clearHistory(userId);
-    await sendMessage(chatId, 'History cleared.', replyTo);
+    await sendMessage(chatId, 'ล้างประวัติแชทแล้ว', replyTo);
+    return;
+  }
+
+  if (text.startsWith('/savenote ')) {
+    const noteText = text.slice('/savenote '.length).trim();
+    if (noteText) {
+      addNote(userId, noteText);
+      await sendMessage(chatId, `บันทึกแล้ว (${getNotes(userId).length} บันทึก)`, replyTo);
+    }
+    return;
+  }
+
+  if (text === '/notes') {
+    const userNotes = getNotes(userId);
+    if (!userNotes.length) {
+      await sendMessage(chatId, 'ยังไม่มีบันทึก', replyTo);
+    } else {
+      await sendMessage(chatId, '*บันทึก:*\n\n' + userNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'), replyTo);
+    }
+    return;
+  }
+
+  if (text === '/clearnotes') {
+    clearNotes(userId);
+    await sendMessage(chatId, 'ล้างบันทึกแล้ว', replyTo);
     return;
   }
 
   if (text === '/usage') {
     await sendMessage(chatId, [
-      '*Token Usage (this deploy)*',
+      '*การใช้งาน (deploy นี้)*',
       '',
       `Calls: ${usage.calls.toLocaleString()}`,
       `Tokens: ${usage.tokens.toLocaleString()}`,
-      `Cap warning: $${MONTHLY_CREDIT_CAP} USD`,
+      `Model: ${MODEL}`,
     ].join('\n'), replyTo);
     return;
   }
 
   if (text === '/model') {
-    await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens`, replyTo);
+    await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens\nEndpoint: ${BASE_URL}`, replyTo);
     return;
   }
 
@@ -276,10 +319,11 @@ async function handleMessage(msg) {
   pushHistory(userId, 'user', text);
   await sendTyping(chatId);
 
-  const messages = getHistory(userId).slice();
+  const history = getHistory(userId).slice();
+  const userNotes = getNotes(userId);
 
   try {
-    const result = await callClaude(messages, SYSTEM_PROMPT);
+    const result = await callVyce(history, SYSTEM_PROMPT, userNotes);
     pushHistory(userId, 'assistant', result.text);
 
     let reply = result.text;
@@ -288,19 +332,14 @@ async function handleMessage(msg) {
     }
 
     const footer = process.env.SHOW_TOKEN_INFO !== 'false'
-      ? `\n\n_\`${result.total} tokens • ${usage.tokens} total\`_`
+      ? `\n\n_\`${result.totalTokens} tokens • ${usage.tokens} total\`_`
       : '';
     await sendMessage(chatId, reply + footer, replyTo);
 
   } catch (e) {
-    if (e instanceof RateLimitError) {
-      await sendMessage(chatId, `⏳ Claude rate limited — wait ${e.retryAfter}s`, replyTo);
-      pushHistory(userId, 'assistant', '[rate limited]');
-    } else {
-      log('error: %s', e.message);
-      await sendMessage(chatId, `Error: ${e.message.slice(0, 200)}`, replyTo);
-      pushHistory(userId, 'assistant', `[error: ${e.message}]`);
-    }
+    log('error: %s', e.message);
+    await sendMessage(chatId, `Error: ${e.message.slice(0, 200)}`, replyTo);
+    pushHistory(userId, 'assistant', `[error: ${e.message}]`);
   }
 }
 
@@ -337,6 +376,7 @@ const healthServer = http.createServer(async (req, res) => {
       ok: keyOk,
       bot: !!BOT_TOKEN,
       model: MODEL,
+      endpoint: BASE_URL,
       calls: usage.calls,
       tokens: usage.tokens,
     }));
@@ -354,8 +394,8 @@ async function main() {
   }
 
   if (!API_KEY) {
-    console.error('FATAL: ANTHROPIC_API_KEY not set');
-    console.error('Get one from https://console.anthropic.com/settings/keys');
+    console.error('FATAL: VYCE_API_KEY not set');
+    console.error('Get one from https://vyceai.com');
     process.exit(1);
   }
 

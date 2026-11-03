@@ -1,21 +1,45 @@
-# Railway Telegram Bot — Anthropic API Key
+# Railway Telegram Bot — Vyce AI API
 
-Deploy: railway up
-Or connect GitHub repo → Railway auto-deploys
+Free $50 credits, 42+ models (Claude, GPT, DeepSeek, Gemini, Grok), OpenAI-compatible.
 
-Required env vars (set in Railway dashboard):
-  TELEGRAM_BOT_TOKEN      — from @BotFather
-  ANTHROPIC_API_KEY       — from https://console.anthropic.com/settings/keys
+## Railway env vars
+
+Required (set in Railway dashboard → Variables):
+
+| Variable | Value |
+|----------|-------|
+| `TELEGRAM_BOT_TOKEN` | from @BotFather |
+| `VYCE_API_KEY` | your Vyce AI API key |
 
 Optional:
-  ALLOWED_USERS           — comma-separated Telegram user IDs
-  CLAUDE_MODEL            — default: claude-sonnet-4-20250514
-  MAX_OUTPUT_TOKENS       — default: 2048
-  SYSTEM_PROMPT           — default: helpful assistant
-  PER_USER_RPM            — default: 10
-  GLOBAL_RPM              — default: 40
-  CONTEXT_TURNS           — default: 6
-  SHOW_TOKEN_INFO         — default: true
-  STATE_FILE              — default: unset (ephemeral in-memory)
 
-Anthropic free tier gives $5 API credit. After it runs out, add billing or the API calls will fail.
+| Variable | Default |
+|----------|---------|
+| `VYCE_MODEL` | `claude-sonnet-4-6` |
+| `VYCE_BASE_URL` | `https://vyceai.com/v1` |
+| `MAX_OUTPUT_TOKENS` | `4096` |
+| `CONTEXT_TURNS` | `20` |
+| `PER_USER_RPM` | `10` |
+| `GLOBAL_RPM` | `30` |
+| `ALLOWED_USERS` | (empty = anyone) |
+| `SYSTEM_PROMPT` | helpful assistant |
+| `SHOW_TOKEN_INFO` | `true` |
+
+## Bot commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | help |
+| `/clear` | clear chat history |
+| `/savenote <text>` | save a note |
+| `/notes` | view all notes |
+| `/clearnotes` | clear all notes |
+| `/usage` | token usage |
+| `/model` | current model |
+
+## Deploy
+
+1. Push to GitHub (already done)
+2. Railway → New Project → Deploy from GitHub repo
+3. Set `TELEGRAM_BOT_TOKEN` and `VYCE_API_KEY` in Variables
+4. Auto-deploys and starts polling
