@@ -367,7 +367,7 @@ async function handleMessage(msg) {
       msg.reply_to_message.from.username === BOT_USERNAME;
     const mentionsByName = /บอล/i.test(text);
     // Reply only when: mentioned by @username, replied to, or the word "บอล" appears.
-    shouldReply = mentionsMe || replyToBot || mentionsByName;
+    shouldReply = mentionsByName; // group: only react when the word "บอล" appears
     // Strip the leading @mention so the model isn't confused by it.
     if (mentionsMe) {
       const m = text.match(/^@\w+\s*/);
@@ -465,6 +465,9 @@ async function handleMessage(msg) {
   if (autoLog && text && text.length > 2) {
     saveTaskNote(userId, msg, text);
   }
+
+  // In groups, stay silent unless the message contains "บอล".
+  if (!shouldReply) return;
 
   const allow = userAllowed(userId);
   if (!allow.ok) {
