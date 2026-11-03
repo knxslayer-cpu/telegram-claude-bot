@@ -345,7 +345,9 @@ async function handleMessage(msg) {
       msg.reply_to_message.from &&
       msg.reply_to_message.from.is_bot === true &&
       msg.reply_to_message.from.username === BOT_USERNAME;
-    shouldReply = mentionsMe || replyToBot;
+    const mentionsByName = /บอล/i.test(text);
+    // Reply only when: mentioned by @username, replied to, or the word "บอล" appears.
+    shouldReply = mentionsMe || replyToBot || mentionsByName;
     // Strip the leading @mention so the model isn't confused by it.
     if (mentionsMe) {
       const m = text.match(/^@\w+\s*/);
