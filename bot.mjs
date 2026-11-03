@@ -382,8 +382,9 @@ async function handleMessage(msg) {
       '• สั่งจดเฉพาะข้อความ: "จดงานนี้: ..." หรือ "ของ X ทำ Y"',
       'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
-      'ในกลุ่ม: ฉันอ่านทุกข้อความแต่จดเฉพาะเมื่อมีคนบอก "บอลจดงาน"',
-      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้สรุป/ตอบ',
+      'ในกลุ่ม: พิมพ์คำว่า "บอล" ตรงไหนก็ได้ในข้อความ เพื่อให้ฉันตอบ/สรุป',
+      'พิมพ์ "บอลจดงาน" (ไม่ว่าตรงไหน) เพื่อให้ฉันวิเคราะห์แชทย้อนหลังแล้วจดงาน',
+      'หรือจะ @username / reply หาฉันก็ได้',
       '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
@@ -413,17 +414,6 @@ async function handleMessage(msg) {
 
   if (text === '/model') {
     await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens\nEndpoint: ${BASE_URL}`, replyTo);
-    return;
-  }
-
-  if (text === '/usage') {
-    await sendMessage(chatId, [
-      '*การใช้งาน (deploy นี้)*',
-      '',
-      `Calls: ${usage.calls.toLocaleString()}`,
-      `Tokens: ${usage.tokens.toLocaleString()}`,
-      `Model: ${MODEL}`,
-    ].join('\n'), replyTo);
     return;
   }
 
@@ -518,8 +508,13 @@ async function poll() {
 
     if (updates.length) saveState();
   } catch (e) {
-    log('poll error: %s — retry in 5s', e.message);
-    await new Promise(r => setTimeout(r, 5000));
+    if (/conflict/i.test(e.message)) {
+      log('⚠️ CONFLICT: another instance is polling token for @%s. Stop the duplicate OR rotate the token in @BotFather, then redeploy. Retry in 10s', BOT_USERNAME);
+      await new Promise(r => setTimeout(r, 10000));
+    } else {
+      log('poll error: %s — retry in 5s', e.message);
+      await new Promise(r => setTimeout(r, 5000));
+    }
   }
 }
 
