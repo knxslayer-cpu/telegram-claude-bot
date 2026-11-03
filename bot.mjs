@@ -24,10 +24,11 @@ const MODEL = process.env.VYCE_MODEL || 'beam-1.0';
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 4096);
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   '你是「ขอเย็ด」(KhoYed) — คนจดงานอัจฉริยะของกลุ่มนี้。' +
-  'หน้าที่: จดงานที่คนพิมพ์ในกลุ่ม แยกตามคนสั่ง (tag [ชื่อ]) เมื่อมีคนบอกให้สรุป ให้เรียกงานที่จดไว้มาจัดเรียงตามคนสั่งและสรุปให้。' +
-  'รับคำสั่งเป็นภาษาพูดธรรมดาได้ เช่น "สรุปงานให้หน่อย" "จดงานนี้: ..." "ล้างประวัติ" — ให้ทำตามโดยไม่ต้องใช้ / คำสั่ง。' +
+  'หน้าที่: จดงานที่คนพิมพ์ในกลุ่ม แยกตาม "ฝ่าย" (department) ถ้ามีคำว่า "ฝ่าย X" ในข้อความ ให้ tag งานนั้นไว้กับฝ่ายนั้น ถ้าไม่มีให้ใช้ชื่อคนสั่งแทน。' +
+  'เมื่อมีคนขอสรุป เช่น "สรุปงานฝ่ายหน้าบ้าน" หรือ "ส่งงานฝ่าย IT ให้หน่อย" ให้ดึงเฉพาะบันทึกที่ tag ตรงกับฝ่ายนั้นมาแสดง สรุปเรียงลำดับ ไม่เอาฝ่ายอื่นมารวม。' +
+  'ถ้าขอสรุปแบบไม่ระบุฝ่าย (เช่น "สรุปงานให้หน่อย") ให้แสดงงานทั้งหมดแยกตามฝ่าย/คน。' +
+  'รับคำสั่งเป็นภาษาพูดธรรมดาได้ เช่น "สรุปงานฝ่ายหน้าบ้าน" "จดงานนี้: ..." "ล้างประวัติ" — ไม่ต้องใช้ / คำสั่ง。' +
   'ถ้าได้รับคำสั่งให้จดงาน ให้ตอบยืนยันสั้นๆ ว่า "จดแล้ว ✅"。' +
-  'ถ้าได้รับคำสั่งให้สรุป ให้ดึงบันทึกทั้งหมดมาแสดงแยกตาม [ชื่อคน] เรียงลำดับ。' +
   'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。Keep it concise but thorough.';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
 const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
@@ -238,6 +239,20 @@ function clearNotes(userId) {
   saveState();
 }
 
+// Save a task note, tagging by department (ฝ่าย) if found, else by person.
+function saveTaskNote(userId, msg, content) {
+  const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
+  // Try to detect a department tag like "ฝ่ายหน้าบ้าน", "ฝ่าย IT", "ฝ่ายบัญชี"
+  const deptMatch = content.match(/ฝ่าย\s*([^\s:：]+)/);
+  let tag;
+  if (deptMatch) {
+    tag = `ฝ่าย${deptMatch[1]}`;
+  } else {
+    tag = who;
+  }
+  addNote(userId, `[${tag}] ${content}`);
+}
+
 // ─── message handling ─────────────────────────────────────────────────
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
@@ -271,11 +286,13 @@ async function handleMessage(msg) {
       '',
       'ฉันอ่านทุกข้อความในกลุ่มแล้วจดงานไว้',
       'พิมพ์แบบคุยธรรมดาได้เลย เช่น:',
-      '• "สรุปงานให้หน่อย" → ฉันสรุปงานที่จดไว้',
+      '• "สรุปงานให้หน่อย" → ฉันสรุปงานที่จดไว้ทั้งหมด',
+      '• "สรุปงานฝ่ายหน้าบ้าน" → ฉันสรุปเฉพาะฝ่ายนั้น',
       '• "จดงานนี้: ..." → ฉันบันทึกเพิ่ม',
       '• "ล้างประวัติ" → ฉันล้างบันทึก',
       '• ถามอะไรก็ได้ → ฉันตอบ',
       '',
+      'ฉันจดงานแยกตาม "ฝ่าย" อัตโนมัติ — พิมพ์ "ฝ่าย X" ในข้อความใด ๆ ฉันจะจดไว้ให้ฝ่ายนั้น',
       'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
       'ในกลุ่ม: ฉันจดทุกข้อความอัตโนมัติ',
@@ -326,8 +343,7 @@ async function handleMessage(msg) {
   // If not mentioned/replied in a group, silently capture the message as a task note.
   if (!shouldReply) {
     if (text && text.length > 2) {
-      const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
-      addNote(userId, `[${who}] ${text}`);
+      saveTaskNote(userId, msg, text);
     }
     return;
   }
@@ -337,8 +353,7 @@ async function handleMessage(msg) {
     const m = text.match(/(?:จดงานนี้|จด|บันทึก|note|save|เพิ่มงาน)\s*[:：]?\s*(.*)/is);
     const content = m && m[1] ? m[1].trim() : text;
     if (content && content.length > 1) {
-      const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
-      addNote(userId, `[${who}] ${content}`);
+      saveTaskNote(userId, msg, content);
       await sendMessage(chatId, `จดแล้ว ✅ (${getNotes(userId).length} รายการ)`, replyTo);
       return;
     }
@@ -350,14 +365,22 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Detect "สรุปงานฝ่าย X" / "ส่งงานฝ่าย X" — filter notes to that department only.
+  const deptReq = text.match(/สรุป|ส่ง|แสดง|ดู|งาน\s*(?:ของ|ฝ่าย)?\s*ฝ่าย\s*([^\s:：]+)/);
+  let filteredNotes = getNotes(userId);
+  let deptFilter = '';
+  if (deptReq && deptReq[1]) {
+    deptFilter = `ฝ่าย${deptReq[1]}`;
+    filteredNotes = filteredNotes.filter(n => n.startsWith(`[${deptFilter}]`));
+  }
+
   pushHistory(userId, 'user', text);
   await sendTyping(chatId);
 
   const history = getHistory(userId).slice();
-  const userNotes = getNotes(userId);
 
   try {
-    const result = await callVyce(history, SYSTEM_PROMPT, userNotes);
+    const result = await callVyce(history, SYSTEM_PROMPT, filteredNotes);
     pushHistory(userId, 'assistant', result.text);
 
     let reply = result.text;
