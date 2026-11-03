@@ -24,10 +24,11 @@ const MODEL = process.env.VYCE_MODEL || 'beam-1.0';
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 4096);
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   '你是「ขอเย็ด」(KhoYed) — คนจดงานอัจฉริยะของกลุ่มนี้。' +
-  'หน้าที่หลัก: จดงานที่คนสั่งในกลุ่ม แยกตามฝ่าย/คนสั่ง แล้วสรุปให้เมื่อมีคนเรียก。' +
-  'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。' +
-  'เวลามีคนเรียกชื่อคุณ ให้สรุปงานที่จดไว้ หรือตอบคำถามตามสั่ง。' +
-  'Keep it concise but thorough.';
+  'หน้าที่: จดงานที่คนพิมพ์ในกลุ่ม แยกตามคนสั่ง (tag [ชื่อ]) เมื่อมีคนบอกให้สรุป ให้เรียกงานที่จดไว้มาจัดเรียงตามคนสั่งและสรุปให้。' +
+  'รับคำสั่งเป็นภาษาพูดธรรมดาได้ เช่น "สรุปงานให้หน่อย" "จดงานนี้: ..." "ล้างประวัติ" — ให้ทำตามโดยไม่ต้องใช้ / คำสั่ง。' +
+  'ถ้าได้รับคำสั่งให้จดงาน ให้ตอบยืนยันสั้นๆ ว่า "จดแล้ว ✅"。' +
+  'ถ้าได้รับคำสั่งให้สรุป ให้ดึงบันทึกทั้งหมดมาแสดงแยกตาม [ชื่อคน] เรียงลำดับ。' +
+  'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。Keep it concise but thorough.';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
 const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -268,18 +269,17 @@ async function handleMessage(msg) {
     await sendMessage(chatId, [
       '👤 *ขอเย็ด* — คนจดงานประจำกลุ่ม',
       '',
-      'ฉันอ่านทุกข้อความในกลุ่มแล้วจดงานไว้ เรียกชื่อฉันเมื่อไหร่ก็สรุปให้',
+      'ฉันอ่านทุกข้อความในกลุ่มแล้วจดงานไว้',
+      'พิมพ์แบบคุยธรรมดาได้เลย เช่น:',
+      '• "สรุปงานให้หน่อย" → ฉันสรุปงานที่จดไว้',
+      '• "จดงานนี้: ..." → ฉันบันทึกเพิ่ม',
+      '• "ล้างประวัติ" → ฉันล้างบันทึก',
+      '• ถามอะไรก็ได้ → ฉันตอบ',
       '',
-      'คำสั่ง:',
-      '/clear — ล้างประวัติแชท',
-      '/notes — ดูบันทึกทั้งหมด',
-      '/savenote <ข้อความ> — บันทึก',
-      '/clearnotes — ล้างบันทึก',
-      '/usage — ดูการใช้งาน',
-      '/model — ดูโมเดลปัจจุบัน',
+      'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
       'ในกลุ่ม: ฉันจดทุกข้อความอัตโนมัติ',
-      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้สรุป/ตอบ',
+      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้ทำงาน',
       '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
@@ -290,53 +290,12 @@ async function handleMessage(msg) {
 
   if (text === '/clear') {
     clearHistory(userId);
-    await sendMessage(chatId, 'ล้างประวัติแชทแล้ว', replyTo);
-    return;
-  }
-
-  if (text.startsWith('/savenote ')) {
-    const noteText = text.slice('/savenote '.length).trim();
-    if (noteText) {
-      addNote(userId, noteText);
-      await sendMessage(chatId, `บันทึกแล้ว (${getNotes(userId).length} บันทึก)`, replyTo);
-    }
-    return;
-  }
-
-  if (text === '/notes' || text === '/tasks') {
-    const userNotes = getNotes(userId);
-    if (!userNotes.length) {
-      await sendMessage(chatId, 'ยังไม่มีงานที่จดไว้', replyTo);
-      return;
-    }
-    // Group by [who] tag
-    const byWho = {};
-    userNotes.forEach(n => {
-      const m = n.match(/^\[(.+?)\]\s*(.*)$/s);
-      if (m) {
-        const who = m[1];
-        const content = m[2];
-        if (!byWho[who]) byWho[who] = [];
-        byWho[who].push(content);
-      } else {
-        if (!byWho['อื่นๆ']) byWho['อื่นๆ'] = [];
-        byWho['อื่นๆ'].push(n);
-      }
-    });
-    let out = `*งานที่จดไว้ (${userNotes.length} รายการ):*\n`;
-    for (const [who, items] of Object.entries(byWho)) {
-      out += `\n*${who}:*\n` + items.map((it, i) => `  ${i + 1}. ${it}`).join('\n') + '\n';
-    }
-    await sendMessage(chatId, out, replyTo);
-    return;
-  }
-
-  if (text === '/clearnotes') {
     clearNotes(userId);
-    await sendMessage(chatId, 'ล้างบันทึกแล้ว', replyTo);
+    await sendMessage(chatId, 'ล้างประวัติและบันทึกแล้ว', replyTo);
     return;
   }
 
+  // Keep /usage and /model as quick info commands
   if (text === '/usage') {
     await sendMessage(chatId, [
       '*การใช้งาน (deploy นี้)*',
@@ -353,6 +312,17 @@ async function handleMessage(msg) {
     return;
   }
 
+  if (text === '/usage') {
+    await sendMessage(chatId, [
+      '*การใช้งาน (deploy นี้)*',
+      '',
+      `Calls: ${usage.calls.toLocaleString()}`,
+      `Tokens: ${usage.tokens.toLocaleString()}`,
+      `Model: ${MODEL}`,
+    ].join('\n'), replyTo);
+    return;
+  }
+
   // If not mentioned/replied in a group, silently capture the message as a task note.
   if (!shouldReply) {
     if (text && text.length > 2) {
@@ -360,6 +330,18 @@ async function handleMessage(msg) {
       addNote(userId, `[${who}] ${text}`);
     }
     return;
+  }
+
+  // Explicit "จดงาน" style command -> save directly, confirm briefly (no AI call).
+  if (/จด|บันทึก|note|save|เพิ่มงาน/i.test(text)) {
+    const m = text.match(/(?:จดงานนี้|จด|บันทึก|note|save|เพิ่มงาน)\s*[:：]?\s*(.*)/is);
+    const content = m && m[1] ? m[1].trim() : text;
+    if (content && content.length > 1) {
+      const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
+      addNote(userId, `[${who}] ${content}`);
+      await sendMessage(chatId, `จดแล้ว ✅ (${getNotes(userId).length} รายการ)`, replyTo);
+      return;
+    }
   }
 
   const allow = userAllowed(userId);
