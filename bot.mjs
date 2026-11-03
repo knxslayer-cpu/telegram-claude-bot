@@ -135,13 +135,25 @@ async function tg(method, payload) {
   return j.result;
 }
 
+async function sendOne(chatId, text, replyTo) {
+  try {
+    return await tg('sendMessage', { chat_id: chatId, text, reply_to_message_id: replyTo, parse_mode: 'Markdown' });
+  } catch (e) {
+    // LLM output often breaks legacy Markdown (e.g. stray ** or _). Retry as plain text.
+    if (/400|parse|entity|markdown/i.test(e.message)) {
+      return await tg('sendMessage', { chat_id: chatId, text, reply_to_message_id: replyTo });
+    }
+    throw e;
+  }
+}
+
 async function sendMessage(chatId, text, replyTo) {
   const maxLen = 4096;
   if (text.length <= maxLen) {
-    return tg('sendMessage', { chat_id: chatId, text, reply_to_message_id: replyTo, parse_mode: 'Markdown' });
+    return sendOne(chatId, text, replyTo);
   }
   for (let i = 0; i < text.length; i += maxLen) {
-    await tg('sendMessage', { chat_id: chatId, text: text.slice(i, i + maxLen), reply_to_message_id: i === 0 ? replyTo : undefined, parse_mode: 'Markdown' });
+    await sendOne(chatId, text.slice(i, i + maxLen), i === 0 ? replyTo : undefined);
   }
 }
 
@@ -326,6 +338,8 @@ async function handleMessage(msg) {
   const replyTo = msg.message_id;
 
   if (!text) return;
+
+  log('recv chat=%d user=%d group=%s: %s', chatId, userId, chatId < 0 ? 'Y' : 'N', text.slice(0, 100));
 
   // Telegram appends @username to commands inside groups, e.g. "/start@Nahsebot_bot".
   // Normalize so command matching works whether or not the suffix is present.
