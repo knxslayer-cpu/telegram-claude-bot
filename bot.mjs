@@ -1,14 +1,12 @@
-// telegram-claude-railway — single-process Telegram bot + Claude Code OAuth bridge.
+// telegram-claude-railway — single-process Telegram bot backed by Anthropic API.
 // Designed for Railway.app: one container, one port, zero dependencies.
 //
 // Architecture:
-//   Telegram ──long poll──> this process ──Bearer OAuth──> api.anthropic.com
-//
-// The bridge logic is inlined — no separate service needed.
+//   Telegram ──long poll──> this process ──API Key──> api.anthropic.com
 //
 // Railway env vars:
-//   TELEGRAM_BOT_TOKEN     — from @BotFather
-//   CLAUDE_CODE_OAUTH_TOKEN — from `claude setup-token`
+//   TELEGRAM_BOT_TOKEN      — from @BotFather
+//   ANTHROPIC_API_KEY       — from https://console.anthropic.com/settings/keys
 //   ALLOWED_USERS           — comma-separated Telegram user IDs (optional)
 //
 // Railway auto-provides PORT. We listen on it for health checks.
@@ -16,24 +14,19 @@
 
 import http from 'node:http';
 import fs from 'node:fs';
-import path from 'node:path';
 
 // ─── config ───────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN || '';
+const API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const UPSTREAM = (process.env.ANTHROPIC_UPSTREAM || 'https://api.anthropic.com').replace(/\/+$/, '');
 const MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 2048);
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT || 'You are a helpful assistant. Reply concisely in the same language the user wrote.';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
 const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 40);
-const WEEKLY_TOKEN_CAP = Number(process.env.WEEKLY_TOKEN_CAP || 800_000);
+const MONTHLY_CREDIT_CAP = Number(process.env.MONTHLY_CREDIT_CAP || 5);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
 const CONTEXT_TURNS = Number(process.env.CONTEXT_TURNS || 6);
-const CLIENT_ID = process.env.CLAUDE_OAUTH_CLIENT_ID || '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const TOKEN_URL = process.env.CLAUDE_OAUTH_TOKEN_URL || 'https://console.anthropic.com/v1/oauth/token';
-const BETA = process.env.CLAUDE_BETA || 'oauth-2025-04-20,claude-code-20250219';
-const CLAUDE_CODE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude.";
 const HEALTH_PORT = Number(process.env.PORT || 3000);
 const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
@@ -41,19 +34,8 @@ const API_BASE = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const userTimestamps = new Map();
 const globalTimestamps = [];
 const conversations = new Map();
-let weeklyTokens = { count: 0, weekStart: getWeekStart() };
+let usage = { tokens: 0, calls: 0 };
 let offset = 0;
-
-// ─── token cache (bridge logic inlined) ───────────────────────────────
-let cached = { accessToken: OAUTH_TOKEN, refreshToken: '', expiresAt: 0 };
-
-function getWeekStart() {
-  const d = new Date();
-  const day = d.getDay() || 7;
-  d.setDate(d.getDate() - day + 1);
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-}
 
 function log(fmt, ...args) {
   const ts = new Date().toISOString();
@@ -65,9 +47,8 @@ function log(fmt, ...args) {
 }
 
 // ─── state persistence (in-memory on Railway — ephemeral) ────────────
-// Railway containers restart = state lost. This is fine for a simple bot.
-// Token counter resets on redeploy. For persistence, add a Railway Volume
-// and set STATE_FILE to the mounted path.
+// Railway containers restart = state lost. Token counter resets on redeploy.
+// For persistence, add a Railway Volume and set STATE_FILE to the mounted path.
 
 function loadState() {
   const sf = process.env.STATE_FILE;
@@ -76,13 +57,13 @@ function loadState() {
     const raw = fs.readFileSync(sf, 'utf8');
     const s = JSON.parse(raw);
     offset = s.offset || 0;
-    weeklyTokens = s.weeklyTokens || { count: 0, weekStart: getWeekStart() };
+    usage = s.usage || { tokens: 0, calls: 0 };
     if (s.conversations) {
       for (const [k, v] of Object.entries(s.conversations)) {
         conversations.set(Number(k), v);
       }
     }
-    log('state loaded: offset=%d weeklyTokens=%d', offset, weeklyTokens.count);
+    log('state loaded: calls=%d tokens=%d', usage.calls, usage.tokens);
   } catch {
     log('no prior state, starting fresh');
   }
@@ -94,62 +75,8 @@ function saveState() {
   try {
     const convObj = {};
     for (const [k, v] of conversations) convObj[k] = v;
-    fs.writeFileSync(sf, JSON.stringify({ offset, weeklyTokens, conversations: convObj }));
+    fs.writeFileSync(sf, JSON.stringify({ offset, usage, conversations: convObj }));
   } catch {}
-}
-
-function checkWeekReset() {
-  const now = getWeekStart();
-  if (now !== weeklyTokens.weekStart) {
-    log('weekly reset: was %d tokens', weeklyTokens.count);
-    weeklyTokens = { count: 0, weekStart: now };
-  }
-}
-
-// ─── OAuth token refresh ──────────────────────────────────────────────
-async function getValidToken() {
-  if (!cached.accessToken) throw new Error('no OAuth token — set CLAUDE_CODE_OAUTH_TOKEN');
-  // If we have a refresh token and token is near expiry, refresh it
-  const exp = cached.expiresAt || 0;
-  if (exp && exp - Date.now() > 120_000) return cached.accessToken;
-  if (!cached.refreshToken) return cached.accessToken; // static token, use as-is
-  log('refreshing oauth token');
-  const r = await fetch(TOKEN_URL, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: cached.refreshToken,
-      client_id: CLIENT_ID,
-    }),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`token refresh failed ${r.status}: ${t.slice(0, 300)}`);
-  }
-  const j = await r.json();
-  if (j.access_token) cached.accessToken = j.access_token;
-  if (j.refresh_token) cached.refreshToken = j.refresh_token;
-  if (j.expires_in) cached.expiresAt = Date.now() + Number(j.expires_in) * 1000;
-  return cached.accessToken;
-}
-
-// ─── system prompt injection (Claude Code identity) ───────────────────
-function injectSystem(payload) {
-  const block = { type: 'text', text: CLAUDE_CODE_SYSTEM };
-  if (!payload.system) {
-    payload.system = [block];
-  } else if (typeof payload.system === 'string') {
-    payload.system = payload.system.startsWith('You are Claude Code')
-      ? [{ type: 'text', text: payload.system }]
-      : [block, { type: 'text', text: payload.system }];
-  } else if (Array.isArray(payload.system)) {
-    const already = payload.system.some(
-      (b) => b && typeof b.text === 'string' && b.text.startsWith('You are Claude Code')
-    );
-    if (!already) payload.system = [block, ...payload.system];
-  }
-  return payload;
 }
 
 // ─── rate limiter ─────────────────────────────────────────────────────
@@ -172,11 +99,6 @@ function userAllowed(userId) {
   pruneOld(globalTimestamps, 60_000);
   if (globalTimestamps.length >= GLOBAL_RPM) {
     return { ok: false, reason: `global rate limit (${GLOBAL_RPM} rpm). Wait ${Math.ceil((globalTimestamps[0] + 60_000 - now) / 1000)}s` };
-  }
-  checkWeekReset();
-  if (weeklyTokens.count >= WEEKLY_TOKEN_CAP) {
-    const resetMs = weeklyTokens.weekStart + 7 * 24 * 60 * 60 * 1000;
-    return { ok: false, reason: `weekly cap reached (${WEEKLY_TOKEN_CAP}). Resets ${new Date(resetMs).toLocaleDateString('en-GB')}` };
   }
   ts.push(now);
   globalTimestamps.push(now);
@@ -209,7 +131,7 @@ async function sendTyping(chatId) {
   try { await tg('sendChatAction', { chat_id: chatId, action: 'typing' }); } catch {}
 }
 
-// ─── claude call (bridge inlined) ─────────────────────────────────────
+// ─── anthropic API call ───────────────────────────────────────────────
 class RateLimitError extends Error {
   constructor(retryAfter, raw) {
     super(`rate limited: retry after ${retryAfter}s`);
@@ -219,15 +141,13 @@ class RateLimitError extends Error {
 }
 
 async function callClaude(messages, systemPrompt) {
-  const token = await getValidToken();
-
-  const payload = injectSystem({
+  const payload = {
     model: MODEL,
     max_tokens: MAX_TOKENS,
     system: systemPrompt,
     messages,
     stream: false,
-  });
+  };
 
   const url = `${UPSTREAM}/v1/messages`;
   log('-> anthropic %s model=%s msgs=%d', url, MODEL, messages.length);
@@ -235,11 +155,10 @@ async function callClaude(messages, systemPrompt) {
   const r = await fetch(url, {
     method: 'POST',
     headers: {
-      'authorization': `Bearer ${token}`,
+      'x-api-key': API_KEY,
       'anthropic-version': '2023-06-01',
-      'anthropic-beta': BETA,
       'content-type': 'application/json',
-      'user-agent': 'claude-cli/2.0.0 (external, cli)',
+      'user-agent': 'telegram-claude-bot/1.0.0',
     },
     body: JSON.stringify(payload),
   });
@@ -274,10 +193,11 @@ async function callClaude(messages, systemPrompt) {
     text = j.content;
   }
 
-  weeklyTokens.count += total;
+  usage.calls += 1;
+  usage.tokens += total;
   saveState();
 
-  log('<- tokens: in=%d out=%d total=%d weekly=%d/%d', inputTokens, outputTokens, total, weeklyTokens.count, WEEKLY_TOKEN_CAP);
+  log('<- tokens: in=%d out=%d total=%d calls=%d', inputTokens, outputTokens, total, usage.calls);
 
   return { text, inputTokens, outputTokens, total };
 }
@@ -316,11 +236,11 @@ async function handleMessage(msg) {
       'Send any message — Claude will reply.',
       '',
       `/clear — clear chat history`,
-      `/usage — token usage this week`,
+      `/usage — token usage`,
       `/model — current model`,
       '',
       `Rate: ${PER_USER_RPM} msg/min/user`,
-      `Weekly cap: ${(WEEKLY_TOKEN_CAP / 1000).toFixed(0)}K tokens`,
+      `Credit cap warning: $${MONTHLY_CREDIT_CAP} USD`,
     ].join('\n'), replyTo);
     return;
   }
@@ -332,16 +252,12 @@ async function handleMessage(msg) {
   }
 
   if (text === '/usage') {
-    checkWeekReset();
-    const pct = ((weeklyTokens.count / WEEKLY_TOKEN_CAP) * 100).toFixed(1);
-    const remaining = WEEKLY_TOKEN_CAP - weeklyTokens.count;
-    const resetMs = weeklyTokens.weekStart + 7 * 24 * 60 * 60 * 1000;
     await sendMessage(chatId, [
-      '*Token Usage (this week)*',
+      '*Token Usage (this deploy)*',
       '',
-      `Used: ${weeklyTokens.count.toLocaleString()} / ${WEEKLY_TOKEN_CAP.toLocaleString()} (${pct}%)`,
-      `Remaining: ${remaining.toLocaleString()}`,
-      `Resets: ${new Date(resetMs).toLocaleDateString('en-GB')}`,
+      `Calls: ${usage.calls.toLocaleString()}`,
+      `Tokens: ${usage.tokens.toLocaleString()}`,
+      `Cap warning: $${MONTHLY_CREDIT_CAP} USD`,
     ].join('\n'), replyTo);
     return;
   }
@@ -372,7 +288,7 @@ async function handleMessage(msg) {
     }
 
     const footer = process.env.SHOW_TOKEN_INFO !== 'false'
-      ? `\n\n_\`${result.total} tokens • weekly ${weeklyTokens.count}/${WEEKLY_TOKEN_CAP}\`_`
+      ? `\n\n_\`${result.total} tokens • ${usage.tokens} total\`_`
       : '';
     await sendMessage(chatId, reply + footer, replyTo);
 
@@ -415,14 +331,14 @@ async function poll() {
 const healthServer = http.createServer(async (req, res) => {
   const url = req.url || '/';
   if (url === '/health' || url === '/') {
-    const tokenOk = !!cached.accessToken;
-    res.writeHead(tokenOk ? 200 : 503, { 'content-type': 'application/json' });
+    const keyOk = !!API_KEY;
+    res.writeHead(keyOk ? 200 : 503, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
-      ok: tokenOk,
+      ok: keyOk,
       bot: !!BOT_TOKEN,
       model: MODEL,
-      weeklyTokens: weeklyTokens.count,
-      weeklyCap: WEEKLY_TOKEN_CAP,
+      calls: usage.calls,
+      tokens: usage.tokens,
     }));
     return;
   }
@@ -434,19 +350,17 @@ const healthServer = http.createServer(async (req, res) => {
 async function main() {
   if (!BOT_TOKEN) {
     console.error('FATAL: TELEGRAM_BOT_TOKEN not set');
-    console.error('Get one from @BotFather on Telegram');
     process.exit(1);
   }
 
-  if (!OAUTH_TOKEN) {
-    console.error('FATAL: CLAUDE_CODE_OAUTH_TOKEN not set');
-    console.error('Get one by running: claude setup-token');
+  if (!API_KEY) {
+    console.error('FATAL: ANTHROPIC_API_KEY not set');
+    console.error('Get one from https://console.anthropic.com/settings/keys');
     process.exit(1);
   }
 
   loadState();
 
-  // Start health server on Railway's PORT
   healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
     log('health server on :%d', HEALTH_PORT);
   });
@@ -454,7 +368,7 @@ async function main() {
   const me = await tg('getMe');
   log('bot online: @%s (%s)', me.username, me.first_name);
   log('model: %s  max_tokens: %d  context: %d turns', MODEL, MAX_TOKENS, CONTEXT_TURNS);
-  log('rate: %d rpm/user  %d rpm global  %d weekly cap', PER_USER_RPM, GLOBAL_RPM, WEEKLY_TOKEN_CAP);
+  log('rate: %d rpm/user  %d rpm global', PER_USER_RPM, GLOBAL_RPM);
   if (ALLOWED_USERS.length) log('allowlist: %s', ALLOWED_USERS.join(', '));
 
   log('polling started');
