@@ -23,8 +23,11 @@ const BASE_URL = (process.env.VYCE_BASE_URL || 'https://vyceai.com/v1').replace(
 const MODEL = process.env.VYCE_MODEL || 'beam-1.0';
 const MAX_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 4096);
 const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
-  'You are a smart, helpful assistant. You take notes, answer questions, and help with work. ' +
-  'Reply in the same language the user wrote. Be concise but thorough.';
+  '你是「ขอเย็ด」(KhoYed) — คนจดงานอัจฉริยะของกลุ่มนี้。' +
+  'หน้าที่หลัก: จดงานที่คนสั่งในกลุ่ม แยกตามฝ่าย/คนสั่ง แล้วสรุปให้เมื่อมีคนเรียก。' +
+  'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。' +
+  'เวลามีคนเรียกชื่อคุณ ให้สรุปงานที่จดไว้ หรือตอบคำถามตามสั่ง。' +
+  'Keep it concise but thorough.';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
 const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -243,8 +246,9 @@ async function handleMessage(msg) {
 
   if (!text) return;
 
-  // In group chats, only respond when the bot is mentioned by username.
+  // Always read every message for note-taking. Only reply when mentioned or replied to.
   const isGroup = chatId < 0;
+  let shouldReply = true;
   if (isGroup) {
     const mentionsMe = msg.entities &&
       msg.entities.some(e => e.type === 'mention' && text.slice(e.offset, e.offset + e.length).startsWith('@'));
@@ -252,7 +256,7 @@ async function handleMessage(msg) {
       msg.reply_to_message.from &&
       msg.reply_to_message.from.is_bot === true &&
       msg.reply_to_message.from.username === BOT_USERNAME;
-    if (!mentionsMe && !replyToBot) return;
+    shouldReply = mentionsMe || replyToBot;
     // Strip the leading @mention so the model isn't confused by it.
     if (mentionsMe) {
       const m = text.match(/^@\w+\s*/);
@@ -262,9 +266,9 @@ async function handleMessage(msg) {
 
   if (text === '/start' || text === '/help') {
     await sendMessage(chatId, [
-      '*Vyce AI Bot* — ผู้ช่วยอัจฉริยะ',
+      '👤 *ขอเย็ด* — คนจดงานประจำกลุ่ม',
       '',
-      'ส่งข้อความอะไรก็ได้ — จดบันทึก ถามคำถาม หรือคุยงาน',
+      'ฉันอ่านทุกข้อความในกลุ่มแล้วจดงานไว้ เรียกชื่อฉันเมื่อไหร่ก็สรุปให้',
       '',
       'คำสั่ง:',
       '/clear — ล้างประวัติแชท',
@@ -274,7 +278,8 @@ async function handleMessage(msg) {
       '/usage — ดูการใช้งาน',
       '/model — ดูโมเดลปัจจุบัน',
       '',
-      'ในกลุ่ม: ต้อง mention ชื่อ bot นำหน้า (เช่น @botname สวัสดี) หรือ reply หา bot',
+      'ในกลุ่ม: ฉันจดทุกข้อความอัตโนมัติ',
+      'เรียกฉันด้วย @username หรือ reply หาฉันเพื่อให้สรุป/ตอบ',
       '',
       `Model: ${MODEL}`,
       `Context: ${CONTEXT_TURNS} turns`,
@@ -298,13 +303,31 @@ async function handleMessage(msg) {
     return;
   }
 
-  if (text === '/notes') {
+  if (text === '/notes' || text === '/tasks') {
     const userNotes = getNotes(userId);
     if (!userNotes.length) {
-      await sendMessage(chatId, 'ยังไม่มีบันทึก', replyTo);
-    } else {
-      await sendMessage(chatId, '*บันทึก:*\n\n' + userNotes.map((n, i) => `${i + 1}. ${n}`).join('\n'), replyTo);
+      await sendMessage(chatId, 'ยังไม่มีงานที่จดไว้', replyTo);
+      return;
     }
+    // Group by [who] tag
+    const byWho = {};
+    userNotes.forEach(n => {
+      const m = n.match(/^\[(.+?)\]\s*(.*)$/s);
+      if (m) {
+        const who = m[1];
+        const content = m[2];
+        if (!byWho[who]) byWho[who] = [];
+        byWho[who].push(content);
+      } else {
+        if (!byWho['อื่นๆ']) byWho['อื่นๆ'] = [];
+        byWho['อื่นๆ'].push(n);
+      }
+    });
+    let out = `*งานที่จดไว้ (${userNotes.length} รายการ):*\n`;
+    for (const [who, items] of Object.entries(byWho)) {
+      out += `\n*${who}:*\n` + items.map((it, i) => `  ${i + 1}. ${it}`).join('\n') + '\n';
+    }
+    await sendMessage(chatId, out, replyTo);
     return;
   }
 
@@ -327,6 +350,15 @@ async function handleMessage(msg) {
 
   if (text === '/model') {
     await sendMessage(chatId, `Model: \`${MODEL}\`\nMax output: ${MAX_TOKENS} tokens\nEndpoint: ${BASE_URL}`, replyTo);
+    return;
+  }
+
+  // If not mentioned/replied in a group, silently capture the message as a task note.
+  if (!shouldReply) {
+    if (text && text.length > 2) {
+      const who = msg.from?.first_name || msg.from?.username || `user${userId}`;
+      addNote(userId, `[${who}] ${text}`);
+    }
     return;
   }
 
