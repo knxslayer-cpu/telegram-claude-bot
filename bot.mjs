@@ -31,7 +31,8 @@ const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
   'รับคำสั่งเป็นภาษาพูดธรรมดาได้ ไม่ต้องใช้ / คำสั่ง。' +
   'ถ้าได้รับคำสั่งให้จดงานชัดเจน ให้ตอบยืนยันสั้นๆ ว่า "จดแล้ว ✅"。' +
   'ถ้าเป็นคำถามทั่วไปหรือบทสนทนา ให้ตอบตามปกติเหมือน AI ผู้ช่วยทั่วไป。' +
-  'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。Keep it concise but thorough.';
+  'ตอบกลับด้วยภาษาที่ผู้ใช้พิมพ์ (ไทย/อังกฤษ)。Keep it concise but thorough。' +
+  'นอกจากนี้ หากถูกถามถึงบุคคล (ระบุ acc หรือ @username) ให้ใช้ข้อมูลชื่อ/ตำแหน่งที่ระบบให้มาตอบ และบอกว่าจดไว้จากใคร。';
 const PER_USER_RPM = Number(process.env.PER_USER_RPM || 10);
 const GLOBAL_RPM = Number(process.env.GLOBAL_RPM || 30);
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -125,6 +126,93 @@ function loadConfig() {
 
 function saveConfig() {
   try { fs.writeFileSync(CONFIG_FILE, JSON.stringify(config)); } catch {}
+}
+
+// ─── people / profile memory ───────────────────────────────────────────
+// Remembers each person's name & position keyed by their Telegram @username (acc).
+// Learns passively from group/private messages and answers lookups like
+// "acc X ชื่ออะไร" / "@X ตำแหน่งอะไร".
+const PROFILES_FILE = process.env.PROFILES_FILE || 'bot-profiles.json';
+const profiles = new Map(); // acc(lower) -> { name, position, by, at }
+
+function loadProfiles() {
+  try {
+    const raw = fs.readFileSync(PROFILES_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    for (const [k, v] of Object.entries(obj)) profiles.set(k.toLowerCase(), v);
+    log('profiles loaded: %d', profiles.size);
+  } catch {}
+}
+
+function saveProfiles() {
+  try {
+    const obj = {};
+    for (const [k, v] of profiles) obj[k] = v;
+    fs.writeFileSync(PROFILES_FILE, JSON.stringify(obj));
+  } catch {}
+}
+
+function saveProfile(acc, data) {
+  if (!acc) return;
+  acc = acc.toLowerCase();
+  const prev = profiles.get(acc) || {};
+  profiles.set(acc, { ...prev, ...data, at: Date.now() });
+  saveProfiles();
+}
+
+function getProfile(acc) {
+  if (!acc) return null;
+  return profiles.get(acc.toLowerCase()) || null;
+}
+
+// Extract a name/position declaration from a message.
+// Returns { acc, name, position, explicit } or null.
+//   explicit = the acc was named directly ("acc X" / "@X ..."), not just the sender.
+function detectProfileDeclaration(text, senderUsername) {
+  const botAcc = (BOT_USERNAME || '').toLowerCase();
+  const sender = (senderUsername || '').toLowerCase();
+
+  const posM = text.match(/(?:ตำแหน่ง|ทำหน้าที่|งานคือ|บทบาท|position|role)\s*[:：]?\s*([\p{L}\p{M}\p{N} ]{2,40}?)(?=\s*(?:ชื่อ|คือ|เป็น|และ|เพิ่มเติม|,|$|。|\.))/iu);
+  let position = posM ? posM[1].trim() : null;
+
+  const accM = text.match(/(?:^|\s)(?:acc|แอค)\s*@?(\w+)/iu) || text.match(/(?:^|\s)@(\w+)/);
+  let declaredAcc = accM ? (accM[1] || accM[2] || '').toLowerCase() : null;
+  if (declaredAcc && declaredAcc === botAcc) declaredAcc = null;
+  const explicit = !!declaredAcc;
+
+  const nameM = text.match(/(?:ชื่อ|คือ|เป็น|ตัวชื่อ|my name is|i am|我叫)\s*[:：]?\s*([\p{L}\p{M}\p{N} ]{2,40}?)(?=\s*(?:ตำแหน่ง|ทำหน้าที่|position|role|และ|เพิ่มเติม|,|$|。|\.))/iu);
+  let name = nameM ? nameM[1].trim() : null;
+  if (!name) {
+    const selfM = text.match(/(?:ฉัน|ผม|เรา|ชั้น|กระผม|หนู|my name)\s+([\p{L}\p{M}\p{N} ]{2,30}?)(?=\s*(?:ตำแหน่ง|ทำหน้าที่|position|role)|$)/iu);
+    if (selfM) name = selfM[1].trim();
+  }
+
+  // Reject obvious question fragments that slipped through.
+  const junk = /(อะไร|ใคร|ไหม|หรือไม่|是谁|是什么|\?)/i;
+  if (name && (junk.test(name) || name.length > 30)) name = null;
+  if (position && (junk.test(position) || position.length > 40)) position = null;
+
+  const acc = declaredAcc || sender;
+  if (!acc) return null;
+  if (!name && !position) return null;
+  return { acc, name: name || null, position: position || null, explicit };
+}
+
+// Detect a query about an acc's name/position.
+// Returns { acc, ask: 'name'|'position'|'both' } or null.
+function detectProfileQuery(text) {
+  const botAcc = (BOT_USERNAME || '').toLowerCase();
+  const accM = text.match(/(?:acc|แอค)\s*@?(\w+)/iu) || text.match(/@(\w+)/);
+  if (!accM) return null;
+  const acc = (accM[1] || accM[2] || '').toLowerCase();
+  if (acc === botAcc) return null;
+  const askName = /(ชื่อ|ใคร|是谁|name|ใครชื่อ|ชื่อคือ|อะไรชื่อ|เรียก)/iu.test(text);
+  const askPos = /(ตำแหน่ง|position|role|หน้าที่|ทำอะไร|ทำหน้าที่|งานคือ)/iu.test(text);
+  if (!askName && !askPos) return null;
+  let ask = 'both';
+  if (askName && !askPos) ask = 'name';
+  else if (askPos && !askName) ask = 'position';
+  return { acc, ask };
 }
 
 // ─── rate limiter ─────────────────────────────────────────────────────
@@ -436,6 +524,7 @@ async function handleMessage(msg) {
       'ไม่ต้องใช้ / คำสั่ง — พิมพ์เป็นภาษาพูดก็ได้',
       '',
       'ในกลุ่ม: ตอบเฉพาะเมื่อข้อความมีคำว่า "บอล" (พิมพ์ตรงไหนก็ได้ในข้อความ)',
+      '• จำคนในกลุ่ม: พิมพ์แนะนำตัว "ฉันชื่อ X ตำแหน่ง Y" (หรือบอก "acc Z ชื่อ X ตำแหน่ง Y") บอทจะจดไว้ — แล้วตอบเมื่อมีคนถาม "acc Z ชื่ออะไร" / "acc Z ตำแหน่งอะไร" (หรือใช้ /who Z)',
       'พิมพ์ "บอลจดงาน" (ไม่ว่าตรงไหน) เพื่อให้ฉันวิเคราะห์แชทย้อนหลังแล้วจดงาน',
       'หมายเหตุ: ในกลุ่มฉันจะเงียบหากข้อความไม่มีคำว่า "บอล"',
       '',
@@ -510,6 +599,27 @@ async function handleMessage(msg) {
     return;
   }
 
+  // Look up a remembered person by their Telegram @username (acc).
+  if (cmd === '/who' || cmd === '/profile') {
+    const a = text.replace(/^\/(who|profile)\s*/i, '').trim().replace(/^@/, '').toLowerCase();
+    if (!a) {
+      await sendMessage(chatId, 'ใช้งาน: /who <acc> เช่น `/who somchai`', replyTo);
+      return;
+    }
+    const p = getProfile(a);
+    if (p) {
+      await sendMessage(chatId, [
+        `ข้อมูล acc *${a}*:`,
+        `• ชื่อ: *${p.name || '-'}*`,
+        `• ตำแหน่ง: *${p.position || '-'}*`,
+        p.by ? `• จดโดย: @${p.by}` : '',
+      ].filter(Boolean).join('\n'), replyTo);
+    } else {
+      await sendMessage(chatId, `ยังไม่มีข้อมูลของ acc *${a}* — ให้คนนั้นแนะนำตัวก่อน (เช่น "ฉันชื่อ ... ตำแหน่ง ...") หรือพิมพ์ "acc ${a} ชื่อ ... ตำแหน่ง ..."`, replyTo);
+    }
+    return;
+  }
+
   // Natural-language teaching in private: "สอนว่า ..." / "จงจำว่า ..."
   if (!isGroup) {
     const nat = text.match(/^(สอนว่า|จงจำว่า|สอนให้|ให้จำว่า)\s*(.+)$/s);
@@ -520,6 +630,48 @@ async function handleMessage(msg) {
       await sendMessage(chatId, `สอนแล้ว ✅ (${config.rules.length} กฎ)\n• ${instr}`, replyTo);
       return;
     }
+  }
+
+  // ─── people / profile memory ─────────────────────────────────────────
+  // Passively learn names/positions from ANY message (group or private), then
+  // answer lookups when the bot is actually called. Keyed by Telegram @username (acc).
+  const senderAccRaw = msg.from?.username;
+  const decl = detectProfileDeclaration(text, senderAccRaw);
+  let declared = false;
+  let declKey = null;
+  if (decl && (decl.name || (decl.explicit && decl.position))) {
+    const botAcc = (BOT_USERNAME || '').toLowerCase();
+    declKey = (decl.acc && decl.acc !== botAcc) ? decl.acc : (senderAccRaw || `user${userId}`).toLowerCase();
+    saveProfile(declKey, { name: decl.name, position: decl.position, by: senderAccRaw || `user${userId}` });
+    declared = true;
+    log('profile saved: acc=%s name=%s position=%s', declKey, decl.name || '-', decl.position || '-');
+  }
+
+  // Lookup query (only when the bot is called).
+  if (shouldReply && !declared) {
+    const q = detectProfileQuery(text);
+    if (q) {
+      const p = getProfile(q.acc);
+      if (p) {
+        const bits = [];
+        if (q.ask === 'name' || q.ask === 'both') bits.push(`ชื่อ: *${p.name || '-'}*`);
+        if (q.ask === 'position' || q.ask === 'both') bits.push(`ตำแหน่ง: *${p.position || '-'}*`);
+        const src = p.by ? `\n(บันทึกจาก @${p.by})` : '';
+        await sendMessage(chatId, `ข้อมูล acc *${q.acc}*:\n${bits.join('\n')}${src}`, replyTo);
+      } else {
+        await sendMessage(chatId, `ยังไม่มีข้อมูลของ acc *${q.acc}* — ให้คนนั้นแนะนำตัวก่อน (เช่น "ฉันชื่อ ... ตำแหน่ง ...") หรือพิมพ์ "acc ${q.acc} ชื่อ ... ตำแหน่ง ..."`, replyTo);
+      }
+      return;
+    }
+  }
+
+  // Confirmation when the bot was called to record a profile.
+  if (shouldReply && declared) {
+    const bits = [];
+    if (decl.name) bits.push(`ชื่อ: *${decl.name}*`);
+    if (decl.position) bits.push(`ตำแหน่ง: *${decl.position}*`);
+    await sendMessage(chatId, `จดข้อมูล acc *${declKey}* แล้ว ✅\n${bits.join('\n')}`, replyTo);
+    return;
   }
 
   // Explicit "บอลจดงาน" in a group -> analyze recent context and log tasks via AI.
@@ -569,13 +721,26 @@ async function handleMessage(msg) {
     filteredNotes = filteredNotes.filter(n => n.startsWith(`[${deptFilter}]`));
   }
 
+  // Inject known profiles for any acc mentioned, so the AI can answer naturally.
+  const mentioned = new Set();
+  for (const m of text.matchAll(/(?:acc|แอค)\s*@?(\w+)/giu)) mentioned.add(m[1].toLowerCase());
+  for (const m of text.matchAll(/(?:^|\s)@(\w+)/g)) mentioned.add(m[1].toLowerCase());
+  const profNotes = [];
+  const botAcc = (BOT_USERNAME || '').toLowerCase();
+  for (const a of mentioned) {
+    if (a === botAcc) continue;
+    const p = getProfile(a);
+    if (p) profNotes.push(`ข้อมูลของ acc ${a}: ชื่อ "${p.name || '-'}" ตำแหน่ง "${p.position || '-'}"`);
+  }
+  const extraNotes = filteredNotes.concat(profNotes);
+
   pushHistory(userId, 'user', text);
   await sendTyping(chatId);
 
   const history = getHistory(userId).slice();
 
   try {
-    const result = await callVyce(history, SYSTEM_PROMPT, filteredNotes);
+    const result = await callVyce(history, SYSTEM_PROMPT, extraNotes);
     pushHistory(userId, 'assistant', result.text);
 
     let reply = result.text;
@@ -636,6 +801,7 @@ const healthServer = http.createServer(async (req, res) => {
       endpoint: BASE_URL,
       calls: usage.calls,
       tokens: usage.tokens,
+      profiles: profiles.size,
     }));
     return;
   }
@@ -658,6 +824,7 @@ async function main() {
 
   loadState();
   loadConfig();
+  loadProfiles();
 
   healthServer.listen(HEALTH_PORT, '0.0.0.0', () => {
     log('health server on :%d', HEALTH_PORT);
